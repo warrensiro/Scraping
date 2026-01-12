@@ -1,12 +1,12 @@
 from dotenv import load_dotenv
 import os
+from openai import OpenAI
 
 # Explicitly point to the project root where your .env is
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 print("API Key loaded:", os.getenv("OPENAI_API_KEY") is not None)
 
-from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 

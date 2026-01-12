@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import traceback
+
 from src.services import (
     scrape_and_store_product,
     fetch_and_store_competitors,
@@ -7,11 +9,24 @@ from src.services import (
 )
 from src.db import Database
 from src.llm import analyze_competitors
-import traceback
 
-# ------------------------------
-# Header & Inputs
-# ------------------------------
+
+@st.cache_resource
+def get_db():
+    return Database()
+
+
+@st.cache_data(ttl=60)
+def get_products():
+    db = get_db()
+    return db.get_all_products()
+
+
+@st.cache_data(ttl=3600)
+def cached_llm_analysis(asin):
+    return analyze_competitors(asin)
+
+
 def render_header():
     st.title("Amazon Competitor Analysis")
     st.caption("Enter your ASIN to get product insights.")
@@ -19,155 +34,187 @@ def render_header():
 
 def render_inputs():
     st.sidebar.header("Product Inputs")
+
     asin = st.sidebar.text_input("ASIN", placeholder="e.g., B0CX23VSAS")
-    geo = st.sidebar.text_input("Zip/Postal Code", placeholder="e.g., 83980")
+    geo = st.sidebar.text_input("Zip / Postal Code", placeholder="e.g., 83980")
     domain = st.sidebar.selectbox(
-        "Domain", ["com", "ca", "co.uk", "de", "fr", "it", "ae"]
+        "Domain", ["com", "ca", "co", "uk", "de", "fr", "it", "ke", "ae"]
     )
+
+    scrape_disabled = not asin.strip()
+
+    if st.sidebar.button("Scrape Product", disabled=scrape_disabled):
+        with st.spinner("Scraping product..."):
+            try:
+                scrape_and_store_product(asin.strip(), geo.strip(), domain)
+                st.success("Product scraped successfully!")
+                st.cache_data.clear()
+            except Exception:
+                st.error("Scraping failed. Check logs.")
+                print(traceback.format_exc())
+
+    if st.sidebar.button("Clear All Products"):
+        clear_all_products()
+        st.cache_data.clear()
+        st.success("All products cleared!")
+
     return asin.strip(), geo.strip(), domain
 
 
-# ------------------------------
-# Product Card & Competitor Display
-# ------------------------------
 def render_product_card(product, domain_default, geo_default):
+    asin = product.get("asin", "Unknown ASIN")
+    title = product.get("title", asin)
+    images = product.get("images") or []
+    price = product.get("price", "-")
+    currency = product.get("currency", "")
+    brand = product.get("brand", "-")
+    url = product.get("url", "")
+
+    domain_info = f"amazon.{product.get('amazon_domain', domain_default)}"
+    geo_info = product.get("geo_location", geo_default or "-")
+
     with st.container():
         cols = st.columns([1, 2])
 
-        # Image
-        images = product.get("images", [])
         if images:
-            cols[0].image(images[0], width=200)
+            cols[0].image(images[0], width=180)
         else:
-            cols[0].write("No image found")
+            cols[0].write("No image")
 
-        # Info
         with cols[1]:
-            st.subheader(product.get("title") or product["asin"])
+            st.subheader(title[:80])
             info_cols = st.columns(3)
-            currency = product.get("currency", "")
-            price = product.get("price", "-")
-            info_cols[0].metric("Price", f"{currency} {price}" if currency else price)
-            info_cols[1].write(f"Brand: {product.get('brand', '-')}")
 
-            domain_info = f"amazon.{product.get('amazon_domain', domain_default)}"
-            geo_info = product.get("geo_location", geo_default or "-")
-            st.caption(f"Domain: {domain_info} | Geo Location: {geo_info}")
-            st.write(product.get("url", ""))
+            info_cols[0].metric(
+                "Price",
+                f"{currency} {price}" if currency else price,
+            )
+            info_cols[1].write(f"Brand: {brand}")
 
-            # ------------------------------
-            # Fetch Competitors Button
-            # ------------------------------
-            analyze_key = f"analyze_{product['asin']}"
+            st.caption(f"Domain: {domain_info} | Geo: {geo_info}")
+            if url:
+                st.markdown(f"[View on Amazon]({url})")
+
+            analyze_key = f"show_{asin}"
             if st.button("Show Competitors", key=analyze_key):
-                st.session_state["analyzing_asin"] = product["asin"]
+                st.session_state.selected_asin = asin
 
-                db = Database()
-                existing_comps = db.search_products({"parent_asin": product["asin"]})
+    if st.session_state.get("selected_asin") != asin:
+        return
 
-                if not existing_comps:
-                    with st.spinner("Fetching competitors..."):
-                        comps = fetch_and_store_competitors(
-                            product["asin"], domain_info.split(".")[1], geo_info
-                        )
-                    st.success(f"Found {len(comps)} competitors!")
-                else:
-                    comps = existing_comps
-                    st.info(f"Found {len(comps)} existing competitors in the database.")
+    db = get_db()
+    existing_comps = db.search_products({"parent_asin": asin})
 
-                if comps:
-                    # Limit competitors for LLM if too many
-                    llm_competitors = comps[:10]
+    if not existing_comps:
+        with st.spinner("Fetching competitors..."):
+            try:
+                comps = fetch_and_store_competitors(
+                    asin,
+                    domain_info.split(".")[1],
+                    geo_info,
+                )
+            except Exception:
+                st.error("Failed to fetch competitors.")
+                print(traceback.format_exc())
+                return
+    else:
+        comps = existing_comps
+        st.info(f"Loaded {len(comps)} competitors from database.")
 
-                    # Competitor DataFrame
-                    df = pd.DataFrame(comps)
-                    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    if not comps:
+        st.warning("No competitors found.")
+        return
 
-                    # Price/Rating Summary
-                    st.markdown("**Competitor Summary**")
-                    st.write(f"Average Price: {df['price'].mean():.2f}")
-                    st.write(f"Lowest Price: {df['price'].min():.2f}")
-                    st.write(f"Highest Price: {df['price'].max():.2f}")
-                    if "rating" in df.columns:
-                        st.write(f"Average Rating: {df['rating'].mean():.2f}")
+    df = pd.DataFrame(comps)
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    else:
+        df["price"] = None
 
-                    # Export CSV
-                    st.download_button(
-                        "Download Competitors CSV",
-                        df.to_csv(index=False),
-                        "competitors.csv",
-                    )
+    st.markdown("Competitor Summary")
+    st.write(f"Average Price: {df['price'].mean():.2f}")
+    st.write(f"Lowest Price: {df['price'].min():.2f}")
+    st.write(f"Highest Price: {df['price'].max():.2f}")
 
-                    # Price Chart
-                    st.markdown("**Price Distribution**")
-                    chart_df = df[["title", "price"]].dropna()
-                    chart_df = chart_df.sort_values("price", ascending=False)
-                    st.bar_chart(chart_df.set_index("title"))
+    if "rating" in df.columns:
+        st.write(f"Average Rating: {df['rating'].mean():.2f}")
 
-                    # Collapsible Competitor List
-                    with st.expander("Show Competitors List"):
-                        for c in comps:
-                            price_str = f"{c.get('currency','')} {c.get('price','-')}"
-                            st.write(
-                                f"- {c.get('asin')} | {c.get('title')} | {price_str}"
-                            )
+    st.download_button(
+        "Download Competitors CSV",
+        df.to_csv(index=False),
+        "competitors.csv",
+    )
 
-                    # ------------------------------
-                    # LLM Analysis Button
-                    # ------------------------------
-                    llm_key = f"llm_{product['asin']}"
-                    if st.button("Analyze Product with LLM", key=llm_key):
-                        with st.spinner("Analyzing product and competitors..."):
-                            try:
-                                analysis_text = analyze_competitors(product["asin"])
-                                st.markdown("**LLM Analysis**")
-                                st.text(analysis_text)
-                            except Exception as e:
-                                st.error("LLM analysis failed. See console for details.")
-                                print(traceback.format_exc())
+    st.markdown("Price Distribution")
+    chart_df = df[["title", "price"]].dropna().sort_values("price", ascending=False)
+    st.bar_chart(chart_df.set_index("title"))
 
-                else:
-                    st.write("No competitors found.")
+    with st.expander("Show Competitor List"):
+        for c in comps:
+            st.write(
+                f"- {c.get('asin')} | {c.get('title')} | {c.get('currency', '')} {c.get('price', '-')}"
+            )
+
+    if not comps:
+        st.warning("No competitors available for LLM analysis.")
+        return
+
+    llm_key = f"llm_{asin}"
+    if st.button("Analyze Product with LLM", key=llm_key):
+        with st.spinner("Analyzing with LLM..."):
+            try:
+                analysis_text = cached_llm_analysis(asin)
+                st.markdown("### LLM Analysis")
+                st.text(analysis_text)
+            except Exception:
+                st.error("LLM analysis failed.")
+                print(traceback.format_exc())
 
 
-# ------------------------------
-# Main App
-# ------------------------------
 def main():
     st.set_page_config(
-        page_title="Amazon Competitor Analysis", layout="wide"
+        page_title="Amazon Competitor Analysis",
+        layout="wide",
     )
+
+    if "selected_asin" not in st.session_state:
+        st.session_state.selected_asin = None
+
+    if "page" not in st.session_state:
+        st.session_state.page = 1
+
     render_header()
     asin, geo, domain = render_inputs()
 
-    # Scrape Product
-    if st.sidebar.button("Scrape Product") and asin:
-        with st.spinner("Scraping product..."):
-            scrape_and_store_product(asin, geo, domain)
-        st.success("Product scraped successfully!")
+    products = get_products()
+    if not products:
+        st.info("No products scraped yet.")
+        return
 
-    # Clear Products
-    if st.sidebar.button("Clear All Products"):
-        clear_all_products()
-        st.success("All products cleared!")
+    st.divider()
+    st.subheader("Products Scraped")
 
-    # Display Products
-    db = Database()
-    products = db.get_all_products()
-    if products:
-        st.divider()
-        st.subheader("Products Scraped")
+    items_per_page = 10
+    total_pages = max(1, (len(products) + items_per_page - 1) // items_per_page)
 
-        items_per_page = 10
-        total_pages = (len(products) + items_per_page - 1) // items_per_page
-        page = st.number_input("Page", min_value=1, max_value=total_pages, value=1) - 1
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("Previous", disabled=st.session_state.page <= 1):
+            st.session_state.page -= 1
+            st.session_state.selected_asin = None
+    with col3:
+        if st.button("Next", disabled=st.session_state.page >= total_pages):
+            st.session_state.page += 1
+            st.session_state.selected_asin = None
 
-        start_idx = page * items_per_page
-        end_idx = min(start_idx + items_per_page, len(products))
-        st.write(f"Showing {start_idx + 1} - {end_idx} of {len(products)} products")
+    page = st.session_state.page
+    start = (page - 1) * items_per_page
+    end = min(start + items_per_page, len(products))
 
-        for p in products[start_idx:end_idx]:
-            render_product_card(p, domain_default=domain, geo_default=geo)
+    st.caption(f"Showing {start + 1} to {end} of {len(products)}")
+
+    for p in products[start:end]:
+        render_product_card(p, domain_default=domain, geo_default=geo)
 
 
 if __name__ == "__main__":

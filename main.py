@@ -125,7 +125,7 @@ def render_product_card(product, domain_default, geo_default):
 
 def render_competitors(asin, domain, geo):
     db = get_db()
-    competitors = db.search_products({"parent_asin": asin})
+    competitors = db.get_competitors(asin)
 
     if not competitors:
         with st.spinner("Fetching competitors..."):
@@ -167,11 +167,12 @@ def render_competitors(asin, domain, geo):
                 f"{c.get('currency', '')} {c.get('price', '-')}"
             )
 
-    if st.button("Analyze with LLM", key=f"llm_{asin}"):
-        with st.spinner("Running LLM analysis..."):
-            result = get_llm_analysis(asin)
-            st.markdown("### LLM Analysis")
-            st.text(result)
+    with st.container():
+        if st.button("Analyze with LLM", key=f"llm_{asin}"):
+            with st.spinner("Running LLM analysis..."):
+                result = get_llm_analysis(asin)
+                st.markdown("### LLM Analysis")
+                st.text(result)
 
 
 def main():

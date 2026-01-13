@@ -43,6 +43,9 @@ def scrape_and_store_product(
         }
     )
 
+    if not data.get("title"):
+        raise ValueError("Scraped product missing title")
+
     db.upsert_product(data)
 
     logger.info("Product stored (upserted): %s", asin)
@@ -101,9 +104,7 @@ def fetch_and_store_competitors(
         {
             r["asin"]
             for r in all_results
-            if r.get("asin")
-            and r.get("title")
-            and r["asin"] != parent_asin
+            if r.get("asin") and r.get("title") and r["asin"] != parent_asin
         }
     )
 

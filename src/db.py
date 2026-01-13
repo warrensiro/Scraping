@@ -12,7 +12,8 @@ class Database:
 
     def __init__(self, db_path: Optional[str] = None):
         # Resolve database path safely
-        base_dir = os.getenv("DATA_DIR", "data")
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        base_dir = os.getenv("DATA_DIR", os.path.join(project_root, "data"))
         os.makedirs(base_dir, exist_ok=True)
 
         self.db_path = db_path or os.path.join(base_dir, "products.json")

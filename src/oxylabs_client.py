@@ -47,16 +47,16 @@ def _post_query(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_content(payload: Any) -> Dict[str, Any]:
-    """
-    Normalize Oxylabs response content shape.
-    """
-    if isinstance(payload, dict):
-        if isinstance(payload.get("results"), list) and payload["results"]:
-            first = payload["results"][0]
-            if isinstance(first, dict):
-                return first.get("content") or {}
-        return payload.get("content") or {}
-    return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    results = payload.get("results")
+    if isinstance(results, list) and results:
+        content = results[0].get("content")
+        if isinstance(content, dict):
+            return content
+
+    return payload.get("content") or {}
 
 
 def scrape_product_details(
@@ -81,6 +81,10 @@ def scrape_product_details(
     content = _extract_content(raw)
 
     product = _normalize_product(content)
+
+    if not product.get("title"):
+        raise ValueError(f"Invalid product data for ASIN {asin}")
+
     product.setdefault("asin", asin)
 
     product.update(
@@ -217,6 +221,8 @@ def scrape_multiple_products(
                 geo_location=geo_location,
                 domain=domain,
             )
+            if not product.get("asin") or not product.get("title"):
+                raise ValueError("Incomplete product data")
             products.append(product)
         except Exception:
             logger.exception("Failed to scrape product %s", asin)

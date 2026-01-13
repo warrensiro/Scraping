@@ -1,10 +1,8 @@
 import logging
 import time
 from typing import Any, Dict, List, Optional
-
 import requests
-
-from src.config import OXYLABS_USERNAME, OXYLABS_PASSWORD
+from src.config import get_oxylabs_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -18,20 +16,18 @@ def _post_query(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute a POST request to Oxylabs with retries and timeout.
     """
-    if not OXYLABS_USERNAME or not OXYLABS_PASSWORD:
-        raise RuntimeError("Oxylabs credentials are not configured")
+    username, password = get_oxylabs_credentials()
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.post(
                 OXYLABS_BASE_URL,
-                auth=(OXYLABS_USERNAME, OXYLABS_PASSWORD),
+                auth=(username, password),
                 json=payload,
                 timeout=REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             return response.json()
-
         except requests.RequestException as exc:
             logger.warning(
                 "Oxylabs request failed (attempt %d/%d): %s",
@@ -49,13 +45,11 @@ def _post_query(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _extract_content(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
-
     results = payload.get("results")
     if isinstance(results, list) and results:
         content = results[0].get("content")
         if isinstance(content, dict):
             return content
-
     return payload.get("content") or {}
 
 
@@ -64,46 +58,31 @@ def scrape_product_details(
     geo_location: Optional[str] = None,
     domain: str = "com",
 ) -> Dict[str, Any]:
-    """
-    Scrape a single Amazon product by ASIN.
-    """
     payload = {
         "source": "amazon_product",
         "query": asin,
         "domain": domain,
         "parse": True,
     }
-
     if geo_location:
         payload["geo_location"] = geo_location
 
     raw = _post_query(payload)
     content = _extract_content(raw)
-
     product = _normalize_product(content)
 
     if not product.get("title"):
         raise ValueError(f"Invalid product data for ASIN {asin}")
 
     product.setdefault("asin", asin)
-
-    product.update(
-        {
-            "amazon_domain": domain,
-            "geo_location": geo_location or "",
-        }
-    )
-
+    product.update({"amazon_domain": domain, "geo_location": geo_location or ""})
     return product
 
 
 def _normalize_product(content: Dict[str, Any]) -> Dict[str, Any]:
     category_path = [
-        c.strip()
-        for c in content.get("category_path", [])
-        if isinstance(c, str) and c.strip()
+        c.strip() for c in content.get("category_path", []) if isinstance(c, str) and c.strip()
     ]
-
     return {
         "asin": content.get("asin"),
         "url": content.get("url"),
@@ -128,13 +107,9 @@ def search_competitors(
     pages: int = 1,
     geo_location: str = "",
 ) -> List[Dict[str, Any]]:
-    """
-    Search Amazon for competitor products.
-    """
     clean_title = _clean_product_name(query_title)
     results: List[Dict[str, Any]] = []
     seen_asins = set()
-
     strategies = ["featured", "price_ascending", "price_descending"]
 
     for sort_by in strategies:
@@ -148,7 +123,6 @@ def search_competitors(
                 "sort_by": sort_by,
                 "geo_location": geo_location,
             }
-
             if categories and categories[0]:
                 payload["refinements"] = {"category": categories[0]}
 
@@ -170,24 +144,19 @@ def search_competitors(
 
 def _extract_search_items(content: Dict[str, Any]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-
     if isinstance(content.get("results"), dict):
         items.extend(content["results"].get("organic", []))
         items.extend(content["results"].get("paid", []))
-
     if isinstance(content.get("products"), list):
         items.extend(content["products"])
-
     return items
 
 
 def _normalize_search_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     asin = item.get("asin") or item.get("product_asin")
     title = item.get("title")
-
     if not asin or not title:
         return None
-
     return {
         "asin": asin,
         "title": title,
@@ -209,23 +178,14 @@ def scrape_multiple_products(
     geo_location: str,
     domain: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Scrape multiple products safely.
-    """
     products: List[Dict[str, Any]] = []
-
     for asin in asins:
         try:
-            product = scrape_product_details(
-                asin=asin,
-                geo_location=geo_location,
-                domain=domain,
-            )
+            product = scrape_product_details(asin, geo_location, domain)
             if not product.get("asin") or not product.get("title"):
                 raise ValueError("Incomplete product data")
             products.append(product)
         except Exception:
             logger.exception("Failed to scrape product %s", asin)
-
     logger.info("Scraped %d/%d products", len(products), len(asins))
     return products

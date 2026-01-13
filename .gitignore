@@ -11,6 +11,9 @@ wheels/
 .venv
 .env
 .env.*
+.streamlit/
+ 
+
 
 
 name.py

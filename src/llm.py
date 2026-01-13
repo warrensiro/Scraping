@@ -85,9 +85,7 @@ Competitors (JSON):
             "domain",
             "competitors",
         ],
-        partial_variables={
-            "format_instructions": parser.get_format_instructions()
-        },
+        partial_variables={"format_instructions": parser.get_format_instructions()},
     )
 
     llm = ChatOpenAI(

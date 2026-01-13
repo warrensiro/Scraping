@@ -1,3 +1,8 @@
+"""
+DEVELOPMENT / SCRATCH FILE
+Not used by the application.
+Do not import.
+"""
 import os
 import requests
 from dotenv import load_dotenv

@@ -1,50 +1,104 @@
-import json
-import os
+import logging
 import time
-import requests
-import streamlit as st
-from dotenv import load_dotenv
+from typing import Any, Dict, List, Optional
 
-load_dotenv()
+import requests
+
+from src.config import OXYLABS_USERNAME, OXYLABS_PASSWORD
+
+logger = logging.getLogger(__name__)
 
 OXYLABS_BASE_URL = "https://realtime.oxylabs.io/v1/queries"
+REQUEST_TIMEOUT = 30  # seconds
+MAX_RETRIES = 3
+RETRY_BACKOFF = 1.5
 
 
-def extract_content(payload):
+def _post_query(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Execute a POST request to Oxylabs with retries and timeout.
+    """
+    if not OXYLABS_USERNAME or not OXYLABS_PASSWORD:
+        raise RuntimeError("Oxylabs credentials are not configured")
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                OXYLABS_BASE_URL,
+                auth=(OXYLABS_USERNAME, OXYLABS_PASSWORD),
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "Oxylabs request failed (attempt %d/%d): %s",
+                attempt,
+                MAX_RETRIES,
+                exc,
+            )
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_BACKOFF * attempt)
+
+    raise RuntimeError("Unreachable Oxylabs request failure")
+
+
+def _extract_content(payload: Any) -> Dict[str, Any]:
+    """
+    Normalize Oxylabs response content shape.
+    """
     if isinstance(payload, dict):
-        if (
-            "results" in payload
-            and isinstance(payload["results"], list)
-            and payload["results"]
-        ):
+        if isinstance(payload.get("results"), list) and payload["results"]:
             first = payload["results"][0]
-            if isinstance(first, dict) and "content" in first:
-                return first["content"] or {}
-        if "content" in payload:
-            return payload.get("content", {})
-    return payload
+            if isinstance(first, dict):
+                return first.get("content") or {}
+        return payload.get("content") or {}
+    return {}
 
 
-def post_query(payload):
-    username = os.getenv("OXYLABS_USERNAME")
-    password = os.getenv("OXYLABS_PASSWORD")
+def scrape_product_details(
+    asin: str,
+    geo_location: Optional[str] = None,
+    domain: str = "com",
+) -> Dict[str, Any]:
+    """
+    Scrape a single Amazon product by ASIN.
+    """
+    payload = {
+        "source": "amazon_product",
+        "query": asin,
+        "domain": domain,
+        "parse": True,
+    }
 
-    if not username or not password:
-        raise ValueError("Oxylabs credentials missing in .env")
+    if geo_location:
+        payload["geo_location"] = geo_location
 
-    response = requests.post(OXYLABS_BASE_URL, auth=(username, password), json=payload)
-    try:
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        print(f"API request failed: {e}\nResponse: {response.text}")
-        raise
-    return response.json()
+    raw = _post_query(payload)
+    content = _extract_content(raw)
+
+    product = _normalize_product(content)
+    product.setdefault("asin", asin)
+
+    product.update(
+        {
+            "amazon_domain": domain,
+            "geo_location": geo_location or "",
+        }
+    )
+
+    return product
 
 
-def normalize_product(content):
-    category_path = []
-    if content.get("category_path"):
-        category_path = [cat.strip() for cat in content["category_path"] if cat]
+def _normalize_product(content: Dict[str, Any]) -> Dict[str, Any]:
+    category_path = [
+        c.strip()
+        for c in content.get("category_path", [])
+        if isinstance(c, str) and c.strip()
+    ]
 
     return {
         "asin": content.get("asin"),
@@ -63,72 +117,73 @@ def normalize_product(content):
     }
 
 
-def scrape_product_details(asin, geo_location=None, domain="ae"):
-    payload = {
-        "source": "amazon_product",
-        "query": asin,
-        "domain": domain,
-        "parse": True,
-    }
+def search_competitors(
+    query_title: str,
+    domain: str,
+    categories: Optional[List[str]] = None,
+    pages: int = 1,
+    geo_location: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Search Amazon for competitor products.
+    """
+    clean_title = _clean_product_name(query_title)
+    results: List[Dict[str, Any]] = []
+    seen_asins = set()
 
-    supported_geo_domains = [
-        "com",
-        "co.uk",
-        "de",
-        "fr",
-        "it",
-        "es",
-        "nl",
-        "ca",
-        "au",
-        "br",
-        "in",
-    ]
-    if geo_location and domain in supported_geo_domains:
-        payload["geo_location"] = geo_location
+    strategies = ["featured", "price_ascending", "price_descending"]
 
-    raw = post_query(payload)
-    content = extract_content(raw)
-    normalized = normalize_product(content)
+    for sort_by in strategies:
+        for page in range(1, max(1, pages) + 1):
+            payload = {
+                "source": "amazon_search",
+                "query": clean_title,
+                "parse": True,
+                "domain": domain,
+                "page": page,
+                "sort_by": sort_by,
+                "geo_location": geo_location,
+            }
 
-    if not normalized.get("asin"):
-        normalized["asin"] = asin
+            if categories and categories[0]:
+                payload["refinements"] = {"category": categories[0]}
 
-    normalized["amazon_domain"] = domain
-    normalized["geo_location"] = geo_location or ""
-    return normalized
+            raw = _post_query(payload)
+            content = _extract_content(raw)
 
+            for item in _extract_search_items(content):
+                normalized = _normalize_search_result(item)
+                if not normalized:
+                    continue
+                asin = normalized["asin"]
+                if asin not in seen_asins:
+                    seen_asins.add(asin)
+                    results.append(normalized)
 
-def clean_product_name(title):
-    if "-" in title:
-        title = title.split("-")[0]
-    if "|" in title:
-        title = title.split("|")[0]
-    return title.strip()
+    logger.info("Found %d competitor candidates", len(results))
+    return results
 
 
-def extract_search_results(content):
-    items = []
-    if not isinstance(content, dict):
-        return items
+def _extract_search_items(content: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
 
-    # Oxylabs sometimes returns "results" with organic/paid, or "products"
-    if "results" in content:
-        results = content["results"]
-        if isinstance(results, dict):
-            items.extend(results.get("organic", []))
-            items.extend(results.get("paid", []))
-    if "products" in content and isinstance(content["products"], list):
+    if isinstance(content.get("results"), dict):
+        items.extend(content["results"].get("organic", []))
+        items.extend(content["results"].get("paid", []))
+
+    if isinstance(content.get("products"), list):
         items.extend(content["products"])
 
     return items
 
 
-def normalize_search_result(item):
+def _normalize_search_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     asin = item.get("asin") or item.get("product_asin")
     title = item.get("title")
+
     if not asin or not title:
         return None
+
     return {
         "asin": asin,
         "title": title,
@@ -138,72 +193,33 @@ def normalize_search_result(item):
     }
 
 
-def search_competitors(query_title, domain, categories=None, pages=1, geo_location=""):
-    st.write("🔍 Searching for competitors...")
-    search_title = clean_product_name(query_title)
-    results = []
-    seen_asins = set()
-
-    strategies = ["featured", "price_ascending", "price_descending"]
-
-    for sort_by in strategies:
-        for page in range(1, max(1, pages) + 1):
-            payload = {
-                "source": "amazon_search",
-                "query": search_title,
-                "parse": True,
-                "domain": domain,
-                "page": page,
-                "sort_by": sort_by,
-                "geo_location": geo_location,
-            }
-
-            # Optional: only apply category if explicitly provided
-            if categories and categories[0]:
-                payload["refinements"] = {"category": categories[0]}
-
-            raw = post_query(payload)
-            content = extract_content(raw)
-            items = extract_search_results(content)
-
-            for item in items:
-                result = normalize_search_result(item)
-                if (
-                    result
-                    and result["asin"] not in seen_asins
-                    and result["asin"] != query_title
-                ):
-                    seen_asins.add(result["asin"])
-                    results.append(result)
-
-            time.sleep(0.1)
-
-    st.write(f"✅ Found {len(results)} competitors")
-    return results
+def _clean_product_name(title: str) -> str:
+    for sep in ("-", "|"):
+        if sep in title:
+            title = title.split(sep)[0]
+    return title.strip()
 
 
-def scrape_multiple_products(asins, geo_location, domain):
-    st.write("Scraping details for competitors...")
-    products = []
+def scrape_multiple_products(
+    asins: List[str],
+    geo_location: str,
+    domain: str,
+) -> List[Dict[str, Any]]:
+    """
+    Scrape multiple products safely.
+    """
+    products: List[Dict[str, Any]] = []
 
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    total = len(asins)
-
-    for index, a in enumerate(asins, 1):
+    for asin in asins:
         try:
-            progress_text.write(f"Processing competitor {index}/{total}: {a}")
-            progress_bar.progress(index / total)
-
-            product = scrape_product_details(a, geo_location, domain)
+            product = scrape_product_details(
+                asin=asin,
+                geo_location=geo_location,
+                domain=domain,
+            )
             products.append(product)
-            progress_text.write(f"Found: {product.get('title', a)}")
-        except Exception as e:
-            progress_text.write(f"Failed to scrape {a}: {e}")
-            continue
-        time.sleep(0.1)
+        except Exception:
+            logger.exception("Failed to scrape product %s", asin)
 
-    progress_text.empty()
-    progress_bar.empty()
-    st.write(f"✅ Successfully scraped {len(products)} out of {total} competitors")
+    logger.info("Scraped %d/%d products", len(products), len(asins))
     return products
